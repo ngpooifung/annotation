@@ -37,7 +37,7 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
         return
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
@@ -45,7 +45,7 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
 
     # Settings for 30fps and 20 seconds limit
     TARGET_FPS = 30
-    MAX_DURATION_SEC = 60
+    MAX_DURATION_SEC = 300
     
     frame_interval = max(1, int(round(fps / TARGET_FPS)))
     output_fps = fps / frame_interval
@@ -58,7 +58,7 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
     def get_face_bbox(keypoints_xy, keypoints_conf, img_w, img_h):
         # COCO keypoint indices: 0:Nose, 1:LEye, 2:REye, 3:LEar, 4:REar
         FACE_INDICES = [0, 1, 2, 3, 4]
-        CONF_THRESH = 0.3
+        CONF_THRESH = 0.2
         
         valid_kps = []
         face_conf_sum = 0
@@ -67,7 +67,7 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
             if keypoints_conf[i] > CONF_THRESH:
                 valid_kps.append(keypoints_xy[i])
         
-        if len(valid_kps) <= 1 or face_conf_sum < 1.5:
+        if len(valid_kps) <= 1 or face_conf_sum < 1.0:
             return None
             
         kps = np.array(valid_kps)
@@ -79,7 +79,21 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
         
         # Add padding
         pad_x = w * 0.5
-        pad_y = h * 2.0 # More padding on top for forehead/hair
+        pad_y = h * 1.5 # More padding on top for forehead/hair
+        
+        current_w = w + 2 * pad_x
+        current_h = h + 2 * pad_y
+
+        # Ensure minimum width 35
+        if current_w < 35:
+            target_w = 35
+            pad_x = (target_w - w) / 2
+            current_w = target_w
+
+        # Ensure height is at least 1.1x width
+        if current_h < 1.1 * current_w:
+            target_h = 1.1 * current_w
+            pad_y = (target_h - h) / 2
         
         x1 = max(0, min_x - pad_x)
         y1 = max(0, min_y - pad_y)
@@ -115,12 +129,14 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
     process_limit = min(frame_count, max_process_frames)
     
     # Initialize Video Writer
-    output_video_path = output_json_path.replace('.json', '_heatmap_vis.avi')
+    output_video_path = output_json_path.replace('.json', f'_{target_id}.avi')
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     out = cv2.VideoWriter(output_video_path, fourcc, output_fps, (width, height))
 
+    final_results = [] # Store JSON data
+
     # Buffer for Centered Smoothing [t-2, t-1, t, t+1, t+2]
-    # Each element: {'frame': frame_img, 'frame_rgb': rgb_img, 'detections': {id: {'face_bbox': ..., 'body_bbox': ...}}}
+    # Each element: {'frame': frame_img, 'frame_rgb': rgb_img, 'detections': {id: {'face_bbox': ..., 'body_bbox': ...}}, 'heatmap': heatmap_img}
     frame_buffer = []
     BUFFER_SIZE = 5
     HALF_WINDOW = 2
@@ -145,7 +161,7 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
             tracker="botsort.yaml",
             verbose=False,
             device=device,
-            conf=0.5,
+            conf=0.3,
             iou=0.72
         )
         
@@ -186,14 +202,28 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
                 
                 current_detections[tid] = {
                     'body_bbox': body_bbox,
-                    'face_bbox': face_bbox
+                    'face_bbox': face_bbox,
+                    'keypoints': kps_xy.tolist()
                 }
 
         current_data = {
+            'frame_index': frame_idx,
             'frame': frame,
             'frame_rgb': frame_rgb,
-            'detections': current_detections
+            'detections': current_detections,
+            'heatmap': None # Will be filled if target_id exists and face is valid
         }
+
+        # Pre-calculate heatmap for current frame if possible (to put in buffer)
+        # We need this for smoothing heatmaps over time
+        if target_id in current_detections:
+            t_det = current_detections[target_id]
+            if t_det['face_bbox'] is not None:
+                raw_heatmap = get_gaze_heatmap(frame_rgb, t_det['face_bbox'])
+                norm_heatmap = cv2.normalize(raw_heatmap, None, 0, 255, cv2.NORM_MINMAX)
+                norm_heatmap = np.uint8(norm_heatmap)
+                heatmap_resized = cv2.resize(norm_heatmap, (width, height), interpolation=cv2.INTER_LINEAR)
+                current_data['heatmap'] = heatmap_resized
 
         # Push to buffer
         frame_buffer.append(current_data)
@@ -216,6 +246,7 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
             # We process target_id specifically
             smoothed_data = {} # store results to draw boxes after heatmap
 
+            # First Pass: Calculate Smoothed Data for ALL IDs
             for pid in unique_ids:
                 # Collect valid boxes from buffer for this pid
                 face_bboxes = []
@@ -250,17 +281,69 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
                 # Store for visualization
                 smoothed_data[pid] = {'face': s_face_bbox, 'body': s_body_bbox}
 
+            # Add Poster Agent (Static)
+            # Face BBox: Top-Left (800, 600), Bottom-Right (850, 700) -> [900, 600, 50, 100]
+            poster_bbox = [930, 530, 60, 90]
+            smoothed_data["POSTER"] = {'face': poster_bbox, 'body': poster_bbox}
+
+            # Second Pass: Generate Heatmap & Calculate Gaze Targets
+            gaze_targets = []
+            pid_heatmap_means = {}
+
+            if target_id in smoothed_data:
+                data = smoothed_data[target_id]
+                s_face_bbox = data['face']
+                s_body_bbox = data['body']
+
+                
                 # VISUALIZATION RULE 1: Target ID Heatmap
-                if pid == target_id and s_face_bbox is not None:
-                    raw_heatmap = get_gaze_heatmap(target_data['frame_rgb'], s_face_bbox)
-                    norm_heatmap = cv2.normalize(raw_heatmap, None, 0, 255, cv2.NORM_MINMAX)
-                    norm_heatmap = np.uint8(norm_heatmap)
-                    heatmap_resized = cv2.resize(norm_heatmap, (width, height), interpolation=cv2.INTER_LINEAR)
-                    heatmap_color = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
+                # Use Smoothed Heatmap
+                valid_heatmaps = [d['heatmap'] for d in frame_buffer if d['heatmap'] is not None]
+                if valid_heatmaps:
+                    # Calculate mean heatmap
+                    # Stack along new axis and take mean
+                    heatmap_stack = np.stack(valid_heatmaps, axis=0)
+                    mean_heatmap = np.mean(heatmap_stack, axis=0).astype(np.uint8)
                     
+                    heatmap_color = cv2.applyColorMap(mean_heatmap, cv2.COLORMAP_JET)
                     vis_frame = cv2.addWeighted(vis_frame, 0.6, heatmap_color, 0.4, 0)
+                    
+                    # Check overlap with other faces to determine gaze targets
+                    for pid, pdata in smoothed_data.items():
+                        if pid == target_id: continue
+                        if pdata['face'] is not None:
+                            fx, fy, fw, fh = pdata['face']
+                            # Extract heatmap region for this face
+                            # Ensure roi is within image bounds
+                            y1, y2 = max(0, fy), min(height, fy+fh)
+                            x1, x2 = max(0, fx), min(width, fx+fw)
+                            
+                            if x2 > x1 and y2 > y1:
+                                roi = mean_heatmap[y1:y2, x1:x2]
+                                mean_val = np.mean(roi)
+                                pid_heatmap_means[pid] = mean_val
+                                # Threshold: if mean heatmap intensity is > 130 (approx 15% of max)
+                                if mean_val > 150:
+                                    gaze_targets.append(pid)
+
+                # Save Data for JSON
+                raw_det = target_data['detections'].get(target_id)
+                kps = raw_det['keypoints'] if raw_det else []
+                
+                final_results.append({
+                    "frame_index": target_data['frame_index'],
+                    "target_id": target_id,
+                    "bbox": s_body_bbox,
+                    "face_bbox": s_face_bbox,
+                    "keypoints": kps,
+                    "gaze_targets": gaze_targets
+                })
 
             # Draw Boxes and Text
+            # Draw Gaze Targets info for Target ID
+            if gaze_targets:
+                cv2.putText(vis_frame, f"GazeTargets: {gaze_targets}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
             for pid, data in smoothed_data.items():
                 s_face = data['face']
                 s_body = data['body']
@@ -270,15 +353,33 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
                         # Draw Smoothed Face Box (Blue)
                         x, y, w, h = s_face
                         cv2.rectangle(vis_frame, (int(x), int(y)), (int(x+w), int(y+h)), (255, 0, 0), 2)
-                        cv2.putText(vis_frame, f"ID: {pid}", (int(x), int(y)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
+                        
+                        label_text = f"ID: {pid}"
+                        # Put text inside bbox, top-left corner
+                        cv2.putText(vis_frame, label_text, (int(x)+5, int(y)+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
                 else:
                     # Other Persons
                     # Rule: Only if they have a valid face detection (s_face is not None)
                     if s_face is not None and s_body is not None:
-                        # Draw Smoothed Body Box (Green)
+                        # Determine Color: Red if gaze target, Green otherwise
+                        bbox_color = (0, 255, 0)
+                        if pid in gaze_targets:
+                            bbox_color = (0, 0, 255) # Red
+
+                        # Draw Smoothed Body Box
                         bx, by, bw, bh = s_body
-                        cv2.rectangle(vis_frame, (int(bx), int(by)), (int(bx+bw), int(by+bh)), (0, 255, 0), 2)
-                        cv2.putText(vis_frame, f"ID: {pid}", (int(bx), int(by)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                        cv2.rectangle(vis_frame, (int(bx), int(by)), (int(bx+bw), int(by+bh)), bbox_color, 2)
+                        
+                        # Draw Smoothed Face Box
+                        # fx, fy, fw, fh = s_face
+                        # cv2.rectangle(vis_frame, (int(fx), int(fy)), (int(fx+fw), int(fy+fh)), bbox_color, 2)
+                        
+                        label = f"ID: {pid}"
+                        if pid in pid_heatmap_means:
+                            label += f" H:{pid_heatmap_means[pid]:.1f}"
+                            
+                        # Put text inside bbox, top-left corner
+                        cv2.putText(vis_frame, label, (int(bx)+5, int(by)+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bbox_color, 1)
             
             out.write(vis_frame)
             frame_buffer.pop(0)
@@ -294,6 +395,7 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
             
         smoothed_data = {}
         
+        # Smooth Logic Loop (First Pass)
         for pid in unique_ids:
             face_bboxes = []
             body_bboxes = []
@@ -318,13 +420,58 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
 
             smoothed_data[pid] = {'face': s_face_bbox, 'body': s_body_bbox}
 
-            if pid == target_id and s_face_bbox is not None:
-                raw_heatmap = get_gaze_heatmap(target_data['frame_rgb'], s_face_bbox)
-                norm_heatmap = cv2.normalize(raw_heatmap, None, 0, 255, cv2.NORM_MINMAX)
-                norm_heatmap = np.uint8(norm_heatmap)
-                heatmap_resized = cv2.resize(norm_heatmap, (width, height), interpolation=cv2.INTER_LINEAR)
-                heatmap_color = cv2.applyColorMap(heatmap_resized, cv2.COLORMAP_JET)
+        # Add Poster Agent (Static) in Flush Loop
+        poster_bbox = [930, 530, 60, 90]
+        smoothed_data["POSTER"] = {'face': poster_bbox, 'body': poster_bbox}
+
+        # Second Pass: Heatmap & Targets
+        gaze_targets = []
+        pid_heatmap_means = {}
+
+        if target_id in smoothed_data:
+            data = smoothed_data[target_id]
+            s_face_bbox = data['face']
+            s_body_bbox = data['body']
+            
+            # Use Smoothed Heatmap from buffer
+            valid_heatmaps = [d['heatmap'] for d in frame_buffer if d['heatmap'] is not None]
+            
+            if valid_heatmaps:
+                # Calculate mean heatmap
+                heatmap_stack = np.stack(valid_heatmaps, axis=0)
+                mean_heatmap = np.mean(heatmap_stack, axis=0).astype(np.uint8)
+                
+                heatmap_color = cv2.applyColorMap(mean_heatmap, cv2.COLORMAP_JET)
                 vis_frame = cv2.addWeighted(vis_frame, 0.6, heatmap_color, 0.4, 0)
+                
+                # Check overlap
+                for pid, pdata in smoothed_data.items():
+                    if pid == target_id: continue
+                    if pdata['face'] is not None:
+                         fx, fy, fw, fh = pdata['face']
+                         y1, y2 = max(0, fy), min(height, fy+fh)
+                         x1, x2 = max(0, fx), min(width, fx+fw)
+                         if x2 > x1 and y2 > y1:
+                             roi = mean_heatmap[y1:y2, x1:x2]
+                             mean_val = np.mean(roi)
+                             pid_heatmap_means[pid] = mean_val
+                             if mean_val > 150:
+                                 gaze_targets.append(pid)
+            
+            raw_det = target_data['detections'].get(target_id)
+            kps = raw_det['keypoints'] if raw_det else []
+            
+            final_results.append({
+                "frame_index": target_data['frame_index'],
+                "target_id": target_id,
+                "bbox": s_body_bbox,
+                "face_bbox": s_face_bbox,
+                "keypoints": kps,
+                "gaze_targets": gaze_targets
+            })
+
+        if gaze_targets:
+            cv2.putText(vis_frame, f"GazeTargets: {gaze_targets}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
         for pid, data in smoothed_data.items():
             s_face = data['face']
@@ -334,18 +481,40 @@ def process_video(video_path, output_json_path, device='cuda:0', target_id=1):
                 if s_face is not None:
                     x, y, w, h = s_face
                     cv2.rectangle(vis_frame, (int(x), int(y)), (int(x+w), int(y+h)), (255, 0, 0), 2)
-                    cv2.putText(vis_frame, f"ID: {pid}", (int(x), int(y)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
+                    
+                    label_text = f"ID: {pid}"
+                    cv2.putText(vis_frame, label_text, (int(x)+5, int(y)+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
             else:
                 if s_face is not None and s_body is not None:
+                    # Determine Color
+                    bbox_color = (0, 255, 0)
+                    if pid in gaze_targets:
+                        bbox_color = (0, 0, 255) # Red
+
                     bx, by, bw, bh = s_body
-                    cv2.rectangle(vis_frame, (int(bx), int(by)), (int(bx+bw), int(by+bh)), (0, 255, 0), 2)
-                    cv2.putText(vis_frame, f"ID: {pid}", (int(bx), int(by)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                    cv2.rectangle(vis_frame, (int(bx), int(by)), (int(bx+bw), int(by+bh)), bbox_color, 2)
+                    
+                    # Draw Smoothed Face Box
+                    # fx, fy, fw, fh = s_face
+                    # cv2.rectangle(vis_frame, (int(fx), int(fy)), (int(fx+fw), int(fy+fh)), bbox_color, 2)
+                    
+                    label = f"ID: {pid}"
+                    if pid in pid_heatmap_means:
+                        label += f" H:{pid_heatmap_means[pid]:.1f}"
+                    # Put text inside bbox
+                    cv2.putText(vis_frame, label, (int(bx)+5, int(by)+15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bbox_color, 1)
 
         out.write(vis_frame)
         frame_buffer.pop(0)
 
     cap.release()
     out.release()
+    
+    # Save JSON
+    print(f"Saving annotations to {output_json_path}")
+    with open(output_json_path, 'w') as f:
+        json.dump(final_results, f, indent=2)
+        
     print("Done! Heatmap visualization saved.")
 
 if __name__ == "__main__":
